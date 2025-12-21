@@ -278,7 +278,7 @@ class ChatGptAutomation:
             return {"1": prompt1, "2": prompt2}
         return {}
 
-    def _ensure_tasks_csv(self, csv_filename: str = "aliens_school_webpages.csv", seed_json: str = "aliens_school_webpages.json") -> Path:
+    def _ensure_tasks_csv(self, csv_filename: str = "todo.csv", seed_json: str = "aliens_school_webpages.json") -> Path:
         csv_path = Path(csv_filename)
         if csv_path.exists():
             return csv_path
