@@ -238,18 +238,28 @@ class ChatGptAutomation:
         except Exception as e:
             print(f"An Error occured when process prompts {e}")
         
-    def load_prompts(self):
-        try:
-            with open("prompts.json", "r") as file:
-                json_text = file.read()
-                data = json.loads(json_text)
-                prompt1 = data.get("1", "")
-                prompt2 = data.get("2", "")
-                prompt3 = data.get("3", "")
+    def load_prompts(self, csv_filename: str = "prompts.csv"):
+        csv_path = Path(__file__).resolve().parent / csv_filename
 
-                return prompt1, prompt2, prompt3
-        except json.JSONDecodeError:
-            return
+        try:
+            with open(csv_path, "r", encoding="utf-8", newline="") as file:
+                reader = csv.DictReader(file)
+                prompts = {
+                    (row.get("id") or "").strip(): row.get("prompt", "")
+                    for row in reader
+                }
+        except FileNotFoundError:
+            self.logger.error("Prompts CSV %s missing hai", csv_path)
+            return "", "", ""
+        except Exception as exc:
+            self.logger.error("Prompts CSV read faild (%s): %s", csv_path, exc)
+            return "", "", ""
+
+        return (
+            prompts.get("1", ""),
+            prompts.get("2", ""),
+            prompts.get("3", "")
+        )
         
     def load_webpage_data(self):
         try:
