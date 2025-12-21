@@ -1,0 +1,15 @@
+2025/12/21-09:03:54.657 94c Reusing MANIFEST C:\Aliens\Agent\temp\chrome-profile\Default\Local Storage\leveldb/MANIFEST-000001
+2025/12/21-09:03:54.670 94c Recovering log #23
+2025/12/21-09:03:54.673 94c Reusing old log C:\Aliens\Agent\temp\chrome-profile\Default\Local Storage\leveldb/000023.log 
+2025/12/21-09:04:54.743 2a44 Level-0 table #27: started
+2025/12/21-09:04:54.749 2a44 Level-0 table #27: 27515 bytes OK
+2025/12/21-09:04:54.751 2a44 Delete type=0 #23
+2025/12/21-09:04:54.752 2a44 Compacting 4@0 + 1@1 files
+2025/12/21-09:04:54.759 2a44 Generated table #28@0: 16 keys, 21668 bytes
+2025/12/21-09:04:54.760 2a44 Compacted 4@0 + 1@1 files => 21668 bytes
+2025/12/21-09:04:54.761 2a44 compacted to: files[ 0 1 1 0 0 0 0 ]
+2025/12/21-09:04:54.762 2a44 Delete type=2 #16
+2025/12/21-09:04:54.762 2a44 Delete type=2 #18
+2025/12/21-09:04:54.762 2a44 Delete type=2 #21
+2025/12/21-09:04:54.762 2a44 Delete type=2 #24
+2025/12/21-09:04:54.762 2a44 Delete type=2 #27
