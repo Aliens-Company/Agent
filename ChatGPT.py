@@ -1,5 +1,6 @@
 import logging
 import csv
+import shutil
 from pathlib import Path
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -16,8 +17,43 @@ from time import sleep, time
 
 from config import CHAT_SESSION_URL
 
+
+BASE_DIR = Path(__file__).resolve().parent
+ALIEN_ROOT = BASE_DIR.parent / ".Alien"
+PROMPT_DIR = ALIEN_ROOT / "Prompt"
+TODO_DIR = ALIEN_ROOT / "ToDo"
+LOG_DIR = ALIEN_ROOT / "Logs"
+TODO_CSV_PATH = TODO_DIR / "todo.csv"
+LEGACY_TODO_CSV_PATH = BASE_DIR / "todo.csv"
+PROMPT_FILE_MAP = {
+    "1": PROMPT_DIR / "Prompt1.md",
+    "2": PROMPT_DIR / "Prompt2.md",
+    "3": PROMPT_DIR / "Prompt3.md",
+}
+PROMPT_CSV_CANDIDATES = [PROMPT_DIR / "prompts.csv", BASE_DIR / "prompts.csv"]
+TODO_SEED_CANDIDATES = [
+    TODO_DIR / "todo.json",
+    PROMPT_DIR / "aliens_school_webpages.json",
+    BASE_DIR / "todo.json",
+    BASE_DIR / "aliens_school_webpages.json",
+]
+WEBPAGE_JSON_CANDIDATES = [
+    PROMPT_DIR / "aliens_school_webpages.json",
+    BASE_DIR / "aliens_school_webpages.json",
+]
+LOG_FILE_PATH = LOG_DIR / "GptBot.log"
+
 class ChatGptAutomation:
     def __init__(self, profile_path=None, profile_name=None):
+        self.prompt_cache = {}
+        self.todo_csv_path = TODO_CSV_PATH
+        self.legacy_todo_csv_path = LEGACY_TODO_CSV_PATH
+        self.todo_seed_candidates = TODO_SEED_CANDIDATES
+        self.webpage_json_candidates = WEBPAGE_JSON_CANDIDATES
+        self.prompt_file_map = PROMPT_FILE_MAP
+        self.prompt_csv_candidates = PROMPT_CSV_CANDIDATES
+        self.log_path = LOG_FILE_PATH
+
         self._setup_logging()
         self.logger.info("Initializing GptBot....")
 
@@ -48,11 +84,12 @@ class ChatGptAutomation:
         self.wait = WebDriverWait(self.driver, 40)
 
     def _setup_logging(self):            # ye ek private function hai logging setup ke liye.
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
         logging.basicConfig(             # logging system configure ho raha hai.
             level=logging.DEBUG,         # sabhi type ke log capture honge(DEBUG,ERROR,INFO,CRITICAL,WARNING).
             format='%(asctime)s - %(levelname)s - %(message)s',  # log ka look dicide karta hai.
             handlers=[                   # handlers batate hai log kaha kaha jana chahiye.
-                logging.FileHandler("GptBot.log", mode="w"),  # Log GptBot.log name ki file me save hoga, or mode="w" ka matalb hai har run par purani log file clear.
+                logging.FileHandler(self.log_path, mode="w"),  # Log shared .Alien folder me save hoga taaki Agent dir clean rahe.
                 logging.StreamHandler()  # log terminal me show hoga.
             ]
         )
@@ -82,6 +119,24 @@ class ChatGptAutomation:
         except Exception as e:
             self.logger.error(f"Click faild: {e}")
 
+    def _send_multiline_text(self, element, text: str):
+        """Textarea me text paste karte waqt newline ke liye Shift+Enter ka use karta hai."""
+        actions = ActionChains(self.driver)
+        actions.move_to_element(element).click().pause(0.1)
+
+        if not text:
+            actions.send_keys(Keys.ENTER).perform()
+            return
+
+        for chunk in text.splitlines(keepends=True):
+            cleaned = chunk.rstrip("\r\n")
+            if cleaned:
+                actions.send_keys(cleaned).pause(0.05)
+            if chunk.endswith(("\n", "\r")):
+                actions.key_down(Keys.SHIFT).send_keys(Keys.ENTER).key_up(Keys.SHIFT).pause(0.05)
+
+        actions.pause(0.1).send_keys(Keys.ENTER).perform()
+
     def type_text(self, locator_type, locator, text: str):
         """Ye funtion input field me text ko fill karta hai or send karta hai."""
         self.logger.info(f"Typing text in element {locator}")
@@ -89,7 +144,7 @@ class ChatGptAutomation:
             element = self.wait.until(Ec.visibility_of_element_located((locator_type, locator)))  # ye function element ka tab tak wait karega jab tak ki element visibile na ho jaye ya timeout tak. until() bar bar funtion call karta hai or check karta  rahata hai.Isme arguments tuple ke form me bheje jate hai.
             element.click()
             sleep(5)
-            self.action.move_to_element(element).click().pause(0.1).send_keys(text).pause(0.1).send_keys(Keys.ENTER).perform()
+            self._send_multiline_text(element, text)
             sleep(2)
         
         except Exception as e:
@@ -223,12 +278,62 @@ class ChatGptAutomation:
         except Exception as e:
             self.logger.error(f"Click Faild: {e}")
   
+    def _find_existing_path(self, candidates):
+        for path in candidates:
+            if path and Path(path).exists():
+                return Path(path)
+        return None
+
+    def _read_prompt_file(self, prompt_id: str) -> str:
+        if prompt_id in self.prompt_cache:
+            return self.prompt_cache[prompt_id]
+
+        prompt_path = self.prompt_file_map.get(prompt_id)
+        if prompt_path and prompt_path.exists():
+            content = prompt_path.read_text(encoding="utf-8")
+            self.prompt_cache[prompt_id] = content
+            return content
+
+        self.logger.warning("Prompt file missing: %s", prompt_path)
+        self.prompt_cache[prompt_id] = ""
+        return ""
+
+    def _load_prompt_markdown(self):
+        prompt_list = [self._read_prompt_file(pid) for pid in ("1", "2", "3")]
+        if any(prompt_list):
+            return tuple(prompt_list)
+        return "", "", ""
+
+    def _render_prompt_template(self, template: str, page_name: str):
+        if not template:
+            return ""
+
+        file_path = page_name or ""
+        file_name = Path(file_path).name if file_path else ""
+        replacements = {
+            "{{FILE_PATH}}": file_path,
+            "{{FILE_NAME}}": file_name,
+        }
+
+        rendered = template
+        for placeholder, value in replacements.items():
+            rendered = rendered.replace(placeholder, value)
+
+        try:
+            rendered = rendered.format(page_name=page_name)
+        except Exception:
+            pass
+
+        return rendered
+        
         
     def load_page_prompt(self):
         """Ye function json file se ek ek karke promts ko utha raha hai or unhe generate kar raha gtp ko dene ke liye or prompts ko return kar raha hai."""
         try:
-            filename = "aliens_school_webpages.json"
-            with open(filename, "r") as file:
+            filename = self._find_existing_path(self.webpage_json_candidates)
+            if not filename:
+                raise FileNotFoundError("Webpage seed list missing in .Alien/Prompt")
+            with open(filename, "r", encoding="utf-8") as file:
                 data = file.read()
                 json_text = json.loads(data)  # loads() function json string ko python data me convert karta hai.
 
@@ -238,8 +343,15 @@ class ChatGptAutomation:
         except Exception as e:
             print(f"An Error occured when process prompts {e}")
         
-    def load_prompts(self, csv_filename: str = "prompts.csv"):
-        csv_path = Path(__file__).resolve().parent / csv_filename
+    def load_prompts(self):
+        markdown_prompts = self._load_prompt_markdown()
+        if any(markdown_prompts):
+            return markdown_prompts
+
+        csv_path = self._find_existing_path(self.prompt_csv_candidates)
+        if not csv_path:
+            self.logger.error("Prompt templates missing. Please add markdown prompts in %s", PROMPT_DIR)
+            return "", "", ""
 
         try:
             with open(csv_path, "r", encoding="utf-8", newline="") as file:
@@ -263,7 +375,10 @@ class ChatGptAutomation:
         
     def load_webpage_data(self):
         try:
-            with open("aliens_school_webpages.json", "r") as file:
+            filename = self._find_existing_path(self.webpage_json_candidates)
+            if not filename:
+                raise FileNotFoundError("Webpage seed list missing in .Alien/Prompt")
+            with open(filename, "r", encoding="utf-8") as file:
                 json_text = file.read()
                 data = json.loads(json_text) 
 
@@ -288,25 +403,39 @@ class ChatGptAutomation:
             return {"1": prompt1, "2": prompt2}
         return {}
 
-    def _ensure_tasks_csv(self, csv_filename: str = "todo.csv", seed_json: str = "aliens_school_webpages.json") -> Path:
-        csv_path = Path(csv_filename)
+    def _ensure_tasks_csv(self) -> Path:
+        csv_path = self.todo_csv_path
         if csv_path.exists():
             return csv_path
 
-        json_path = Path(seed_json)
-        if not json_path.exists():
-            raise FileNotFoundError(f"Neither {csv_filename} nor {seed_json} found")
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(json_path, "r", encoding="utf-8") as file:
+        if self.legacy_todo_csv_path.exists():
+            shutil.copy2(self.legacy_todo_csv_path, csv_path)
+            self.logger.info("Legacy todo CSV migrated to %s", csv_path)
+            return csv_path
+
+        seed_json = self._find_existing_path(self.todo_seed_candidates)
+        if not seed_json:
+            raise FileNotFoundError(
+                "Todo CSV missing and no seed list found in .Alien/ToDo or .Alien/Prompt"
+            )
+
+        with open(seed_json, "r", encoding="utf-8") as file:
             data = json.load(file)
 
         fieldnames = ["id", "page_name", "status", "url"]
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
         with open(csv_path, "w", encoding="utf-8", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
-            for key, value in data.items():
-                writer.writerow({"id": key, "page_name": value, "status": "0", "url": ""})
+
+            items = data.items() if isinstance(data, dict) else enumerate(data, start=1)
+            for key, value in items:
+                if isinstance(value, dict):
+                    page_name = value.get("page_name") or value.get("name") or value.get("title") or ""
+                else:
+                    page_name = value
+                writer.writerow({"id": key, "page_name": page_name, "status": "0", "url": ""})
 
         self.logger.info("CSV task list create ki gayi %s se", csv_path)
         return csv_path
@@ -327,6 +456,7 @@ class ChatGptAutomation:
         return rows, fieldnames
 
     def _write_tasks(self, csv_path: Path, rows, fieldnames):
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
         with open(csv_path, "w", encoding="utf-8", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
@@ -343,11 +473,11 @@ class ChatGptAutomation:
     def _prepare_prompts(self, page_name: str):
         prompt1, prompt2, prompt3 = self.load_prompts()
         if not any([prompt1, prompt2, prompt3]):
-            raise ValueError("Prompt templates missing in prompts.json")
+            raise ValueError("Prompt templates missing in .Alien/Prompt")
         return (
-            prompt1.format(page_name=page_name),
-            prompt2.format(page_name=page_name),
-            prompt3.format(page_name=page_name)
+            self._render_prompt_template(prompt1, page_name),
+            self._render_prompt_template(prompt2, page_name),
+            self._render_prompt_template(prompt3, page_name)
         )
 
     def _process_page(self, page_name: str, send_button_locator, download_link_xpath) -> tuple[bool, str]:
