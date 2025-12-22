@@ -15,9 +15,21 @@
 - `screen_capture2.py` – MSS + Pillow से स्क्रीनशॉट लेना और base64 एनकोड करना।
 - `text_input.py` – CLI के जरिए यूज़र कमांड लेना और डेस्कटॉप तैयार करना।
 - `action_execution2.py` – PyAutoGUI के जरिए किसी पॉइंट पर क्लिक करवाना।
-- `config.py` – API keys, endpoints और ChatGPT सत्र URL। (प्रोडक्शन में env vars इस्तेमाल करें।)
-- `prompts.csv` / `aliens_school_webpages.json` – पेज नाम और प्रॉम्प्ट टेम्पलेट डेटा-सोर्स।
-- `todo.csv` / `todo.json` – प्रॉसेस किए गए पेजों की ट्रैकिंग (ज़रूरत पर `ChatGPT.py` खुद बनाता है)।
+- `config.py` – `.Alien/Config/Agent.py` से secrets लोड करने वाला हल्का shim (फाइल खुद `.Alien` में रहती है)।
+- `prompts.csv` / `aliens_school_webpages.json` – (legacy mention) अब इन्हें `.Alien` में रखा गया है ताकि Agent फ़ोल्डर रनटाइम में untouched रहे।
+- `todo.csv` / `todo.json` – प्रॉसेस किए गए पेजों की ट्रैकिंग; writable कॉपी `.Alien/ToDo/todo.csv` में रहती है।
+
+## Shared `.Alien` resource hub
+
+ChatGPT ऑटोमेशन से जुड़ी हर editable/writable फ़ाइल अब sibling रिपॉज़िटरी `.Alien` में रहती है:
+
+- `.Alien/Config/Agent.py` – Azure / ChatGPT credentials और session URLs.
+- `.Alien/Prompt/Prompt1.md`, `Prompt2.md`, `Prompt3.md` – Markdown टेम्पलेट्स जिनमें `{{FILE_PATH}}` और `{{FILE_NAME}}` placeholders हैं।
+- `.Alien/Prompt/aliens_school_webpages.json` (optional) – seed list जिससे पहली बार TODO CSV बन सकती है।
+- `.Alien/ToDo/todo.csv` – Chrome ऑटोमेशन की प्रगति ट्रैक करने वाली फाइल (status 0/1/2, download URL कॉलम)।
+- `.Alien/Logs/GptBot.log` – Selenium रन के दौरान बनने वाली log फाइल।
+
+> ChatGPT.py अब `.Alien` को auto-detect करके वहीँ read/write करता है, इसलिए एजेंट फ़ोल्डर में कोई runtime mutation नहीं होता।
 
 ## पूर्व-आवश्यकताएँ
 
@@ -41,7 +53,7 @@ pip install -r requirements.txt
 
 ## कॉन्फ़िगरेशन
 
-`config.py` में मौजूद मानों को सीधे कमिट नहीं करना चाहिए। सुरक्षित तरीके:
+`config.py` अब सिर्फ `.Alien/Config/Agent.py` को import करके values expose करता है, इसलिए secrets वहीं रखें और git से बाहर रखें। सुरक्षित तरीके:
 
 - `AZURE_API_KEY`, `AZURE_ENDPOINT`, `AZURE_API_VERSION`, `LLM_DEPLOYMENT` को environment variables के रूप में सेट करें और `config.py` में `os.getenv` के जरिए रीफरेंस करें।
 - `CHAT_SESSION_URL` को उस GPT चैट URL से अपडेट रखें जिसे Selenium ऑटोमेट करता है।
@@ -49,8 +61,8 @@ pip install -r requirements.txt
 ## ChatGPT Automation वर्कफ़्लो (`ChatGPT.py`)
 
 1. Selenium Chrome से ChatGPT conversation पेज खोलता है।
-2. `aliens_school_webpages.json` से हर पेज नाम पर लूप चलता है।
-3. हर पेज के लिए `prompts.csv` से तीन टेम्पलेट लोड होते हैं:
+2. `.Alien/ToDo/todo.csv` से अगला pending file path (page_name) उठाया जाता है। पहली रन पर यह फाइल `.Alien/Prompt/aliens_school_webpages.json` या legacy JSON से seed हो सकती है।
+3. हर पेज के लिए `.Alien/Prompt/Prompt1.md`, `Prompt2.md`, `Prompt3.md` Markdown टेम्पलेट लोड होते हैं:
 	- प्रॉम्प्ट 1: detailed planning
 	- प्रॉम्प्ट 2: downloadable कोड
 	- प्रॉम्प्ट 3: वैकल्पिक/अतिरिक्त आउटपुट (फाइल डाउनलोड का दूसरा प्रयास)
@@ -58,9 +70,9 @@ pip install -r requirements.txt
 5. `type_text()` textarea में प्रॉम्प्ट डालता है, Enter करता है।
 6. `check_response_complete()` “Stop generating” बटन गायब होने तक वेट करता है।
 7. `scroll_until_link_present()` और `download_file()` download लिंक तक स्क्रॉल करके क्लिक करते हैं।
-8. सफल होने पर `todo.csv` में status अपडेट होता है, URL सेव होता है, और टैब बंद कर दिया जाता है।
+8. सफल होने पर `.Alien/ToDo/todo.csv` में status अपडेट होता है, URL सेव होता है, और टैब बंद कर दिया जाता है।
 
-> लॉग्स `GptBot.log` में सेव होते हैं। हर रन में फाइल रीसेट होती है (mode=`"w"`).
+> लॉग्स `.Alien/Logs/GptBot.log` में सेव होते हैं। हर रन में फाइल रीसेट होती है (mode=`"w"`).
 
 ### रन कैसे करें
 
@@ -97,9 +109,9 @@ python main.py
 
 ## डेटा फाइल्स
 
-- `aliens_school_webpages.json` – key/value मैप, हर value एक page name है।
-- `prompts.csv` – `id` (`1`, `2`, `3`) और `prompt` कॉलम। प्लेसहोल्डर `{page_name}` रन-टाइम पर रिप्लेस होता है।
-- `todo.csv` – `status` (`0` pending, `1` done) और `url` कॉलम; पहली रन पर ऑटो-जनरेट हो सकती है।
+- `.Alien/Prompt/aliens_school_webpages.json` – optional key/value seed list; हर value एक file path है।
+- `.Alien/Prompt/Prompt1.md` / `Prompt2.md` / `Prompt3.md` – Markdown टेम्पलेट्स जिनमें `{{FILE_PATH}}`, `{{FILE_NAME}}`, `{page_name}` placeholders मिलते हैं।
+- `.Alien/ToDo/todo.csv` – `status` (`0` pending, `1` success, `2` failed) और `url` कॉलम; रनटाइम में सिर्फ यही फाइल mutate होती है।
 
 ## ट्रबलशूटिंग
 
