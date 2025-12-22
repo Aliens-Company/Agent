@@ -1,7 +1,13 @@
 import logging
 import csv
+import random
 import shutil
+import queue
+import threading
 from pathlib import Path
+from typing import Optional
+from datetime import datetime
+from openai import AzureOpenAI
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -12,15 +18,26 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import NoSuchElementException
 import pyautogui
+try:
+    import tkinter as tk
+except Exception:  # pragma: no cover - tkinter optional
+    tk = None
 import json
 from time import sleep, time
 
-from config import CHAT_SESSION_URL
+from config import (
+    CHAT_SESSION_URL,
+    AZURE_API_KEY,
+    AZURE_ENDPOINT,
+    AZURE_API_VERSION,
+    LLM_DEPLOYMENT,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
 ALIEN_ROOT = BASE_DIR.parent / ".Alien"
 PROMPT_DIR = ALIEN_ROOT / "Prompt"
+PROMPT_ARCHIVE_DIR = ALIEN_ROOT / "Prompts"
 TODO_DIR = ALIEN_ROOT / "ToDo"
 LOG_DIR = ALIEN_ROOT / "Logs"
 TODO_CSV_PATH = TODO_DIR / "todo.csv"
@@ -43,6 +60,100 @@ WEBPAGE_JSON_CANDIDATES = [
 ]
 LOG_FILE_PATH = LOG_DIR / "GptBot.log"
 
+
+class SystemSnackbar:
+    """Lightweight top-right overlay to show automation status."""
+
+    def __init__(self, initial_message: str = "Automation warming up..."):
+        self.initial_message = initial_message
+        self._queue: "queue.Queue[str]" = queue.Queue()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._enabled = tk is not None
+        if self._enabled:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def _run(self):
+        try:
+            self._root = tk.Tk()
+        except Exception:
+            self._enabled = False
+            return
+
+        self._root.overrideredirect(True)
+        self._root.lift()
+        self._root.attributes("-topmost", True)
+        self._root.configure(bg="#000000")
+
+        screen_w = self._root.winfo_screenwidth()
+        screen_h = self._root.winfo_screenheight()
+        width = max(300, int(screen_h * 0.5))
+        height = 77
+        x_pos = max(0, screen_w - width - 111)
+        y_pos = 25
+        self._root.geometry(f"{width}x{height}+{x_pos}+{y_pos}")
+
+        self._label = tk.Label(
+            self._root,
+            text=self.initial_message,
+            bg="#000000",
+            fg="#ffffff",
+            font=("Segoe UI", 9),
+            anchor="w",
+            padx=18,
+            pady=10,
+        )
+        self._label.pack(fill="both", expand=True)
+
+        self._poll_queue()
+        self._root.mainloop()
+
+    def _poll_queue(self):
+        if self._stop_event.is_set():
+            try:
+                self._root.destroy()
+            except Exception:
+                pass
+            return
+
+        try:
+            while True:
+                message = self._queue.get_nowait()
+                self._label.config(text=message)
+        except queue.Empty:
+            pass
+
+        self._root.after(150, self._poll_queue)
+
+    def show(self, message: str):
+        if not self._enabled or not message:
+            return
+        self._queue.put(message)
+
+    def close(self):
+        if not self._enabled:
+            return
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.5)
+
+
+class SnackbarLogHandler(logging.Handler):
+    """Routes log records to the on-screen snackbar for quick visibility."""
+
+    def __init__(self, update_callback):
+        super().__init__(level=logging.INFO)
+        self.update_callback = update_callback
+        self.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+
+    def emit(self, record):
+        try:
+            message = self.format(record)
+            self.update_callback(message[:200])  # snackbar me concise text
+        except Exception:
+            pass
+
 class ChatGptAutomation:
     def __init__(self, profile_path=None, profile_name=None):
         self.prompt_cache = {}
@@ -53,9 +164,18 @@ class ChatGptAutomation:
         self.prompt_file_map = PROMPT_FILE_MAP
         self.prompt_csv_candidates = PROMPT_CSV_CANDIDATES
         self.log_path = LOG_FILE_PATH
+        self.prompt_archive_dir = PROMPT_ARCHIVE_DIR
+        self.typing_delay_range = (0.08, 0.35)
+        self.short_pause_range = (1.4, 3.2)
+        self.long_pause_range = (4.5, 7.5)
+        self.idle_scroll_probability = 0.45
+        self.llm_client = None
+        self.llm_deployment = LLM_DEPLOYMENT
+        self.snackbar = SystemSnackbar("Agent init in progress…")
 
         self._setup_logging()
         self.logger.info("Initializing GptBot....")
+        self._init_prompt_refiner()
 
         
         chrome_options = Options()
@@ -79,6 +199,7 @@ class ChatGptAutomation:
         )
 
         self.driver = webdriver.Chrome(options=chrome_options)
+        self._apply_stealth_patches()
         self.driver.maximize_window()                                                      # window size ko maximize karta hai.
         self.action = ActionChains(self.driver)
         self.wait = WebDriverWait(self.driver, 40)
@@ -94,13 +215,139 @@ class ChatGptAutomation:
             ]
         )
         self.logger = logging.getLogger("WebBot") # Yaha logging object create kiya hai name diya hai WebBot
+        try:
+            handler = SnackbarLogHandler(self._update_snackbar)
+            logging.getLogger().addHandler(handler)
+            self.snackbar_handler = handler
+        except Exception:
+            self.snackbar_handler = None
+
+    def _init_prompt_refiner(self):
+        if not all([AZURE_API_KEY, AZURE_ENDPOINT, AZURE_API_VERSION, self.llm_deployment]):
+            self.logger.warning("Azure OpenAI credentials incomplete, prompt refiner skip.")
+            return
+
+        try:
+            self.llm_client = AzureOpenAI(
+                api_key=AZURE_API_KEY,
+                azure_endpoint=AZURE_ENDPOINT,
+                api_version=AZURE_API_VERSION,
+            )
+            self.logger.info("Prompt refiner ready via Azure OpenAI deployment %s", self.llm_deployment)
+        except Exception as exc:
+            self.llm_client = None
+            self.logger.warning("Prompt refiner init fail: %s", exc)
+
+    def _human_pause(self, minimum=None, maximum=None):
+        """Har action ke beech human-like random delay add karta hai."""
+        low, high = self.short_pause_range
+        if minimum is not None:
+            low = minimum
+        if maximum is not None:
+            high = maximum
+
+        if low > high:
+            low, high = high, low
+
+        delay = random.uniform(low, high)
+        sleep(delay)
+        if random.random() < 0.4:
+            self._background_mouse_wiggle()
+        return delay
+
+    def _random_typing_delay(self):
+        return random.uniform(*self.typing_delay_range)
+
+    def _simulate_idle_user_activity(self):
+        """Page par halka scroll/idle interaction create karta hai."""
+        if random.random() > self.idle_scroll_probability:
+            self._background_mouse_wiggle()
+            return
+
+        try:
+            scroll_distance = random.randint(180, 420) * random.choice([-1, 1])
+            self.driver.execute_script("window.scrollBy(0, arguments[0]);", scroll_distance)
+            self._human_pause(0.8, 1.6)
+            self.driver.execute_script("window.scrollBy(0, arguments[0]);", -scroll_distance + random.randint(-60, 60))
+        except Exception as exc:
+            self.logger.debug("Idle interaction skip: %s", exc)
+        finally:
+            self._background_mouse_wiggle()
+
+    def _post_prompt_routine(self):
+        self._human_pause(2.2, 4.0)
+        self._simulate_idle_user_activity()
+
+    def _update_snackbar(self, message: str):
+        try:
+            if self.snackbar:
+                self.snackbar.show(message)
+        except Exception:
+            pass
+
+    def _background_mouse_wiggle(self):
+        try:
+            current_x, current_y = pyautogui.position()
+            offset_x = random.randint(-40, 40)
+            offset_y = random.randint(-25, 25)
+            target_x = max(2, current_x + offset_x)
+            target_y = max(2, current_y + offset_y)
+            duration = random.uniform(0.2, 0.6)
+            pyautogui.moveTo(target_x, target_y, duration=duration)
+        except Exception as exc:
+            self.logger.debug("Mouse wiggle skip: %s", exc)
+
+    def _move_mouse(self, x: float, y: float, jitter: float = 18.0):
+        try:
+            target_x = x + random.uniform(-jitter, jitter)
+            target_y = y + random.uniform(-jitter, jitter)
+            duration = random.uniform(0.35, 0.9)
+            pyautogui.moveTo(target_x, target_y, duration=duration)
+        except Exception as exc:
+            self.logger.debug("Mouse move skip: %s", exc)
+
+    def _move_mouse_to_element(self, element: Optional[object]):
+        if element is None:
+            return
+
+        try:
+            coords = self.driver.execute_script(
+                "const r = arguments[0].getBoundingClientRect();"
+                "const offsetX = window.screenX + (window.outerWidth - window.innerWidth);"
+                "const offsetY = window.screenY + (window.outerHeight - window.innerHeight);"
+                "return {x: r.left + r.width / 2 + offsetX, y: r.top + r.height / 2 + offsetY};",
+                element,
+            )
+            if coords and "x" in coords and "y" in coords:
+                self._move_mouse(coords["x"], coords["y"], jitter=22.0)
+        except Exception as exc:
+            self.logger.debug("Element mouse move skip: %s", exc)
+
+    def _apply_stealth_patches(self):
+        scripts = [
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});",
+            "window.navigator.chrome = { runtime: {} };",
+            "Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});",
+            "Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4]});"
+        ]
+
+        for script in scripts:
+            try:
+                self.driver.execute_cdp_cmd(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {"source": script}
+                )
+            except Exception as exc:
+                self.logger.debug("Stealth patch fail: %s", exc)
 
     def open_url(self, url: str):
         """Ye function url ko open karta hai."""
         self.logger.info(f"Opning Url {url}")
         try:
             self.driver.get(url)
-            sleep(3)
+            self._human_pause(5.0, 7.8)
+            self._simulate_idle_user_activity()
+            self._update_snackbar("Chat session ready")
         except Exception as e:
             self.logger.error(f"Faild to open Url: {e}")
 
@@ -113,6 +360,7 @@ class ChatGptAutomation:
             print(lenth)
             last_element = element[-1]
             self.logger.info(f"Element lenth: {lenth}")
+            self._move_mouse_to_element(last_element)
 
             last_element.send_keys(Keys.ENTER)  # Iske bina element par click nhi ho sakata hai kisi bhi tarike se kyonki element div ke niche hai.
             
@@ -122,7 +370,7 @@ class ChatGptAutomation:
     def _send_multiline_text(self, element, text: str):
         """Textarea me text paste karte waqt newline ke liye Shift+Enter ka use karta hai."""
         actions = ActionChains(self.driver)
-        actions.move_to_element(element).click().pause(0.1)
+        actions.move_to_element(element).click().pause(self._random_typing_delay())
 
         if not text:
             actions.send_keys(Keys.ENTER).perform()
@@ -131,21 +379,22 @@ class ChatGptAutomation:
         for chunk in text.splitlines(keepends=True):
             cleaned = chunk.rstrip("\r\n")
             if cleaned:
-                actions.send_keys(cleaned).pause(0.05)
+                actions.send_keys(cleaned).pause(self._random_typing_delay())
             if chunk.endswith(("\n", "\r")):
-                actions.key_down(Keys.SHIFT).send_keys(Keys.ENTER).key_up(Keys.SHIFT).pause(0.05)
+                actions.key_down(Keys.SHIFT).send_keys(Keys.ENTER).key_up(Keys.SHIFT).pause(self._random_typing_delay())
 
-        actions.pause(0.1).send_keys(Keys.ENTER).perform()
+        actions.pause(self._random_typing_delay()).send_keys(Keys.ENTER).perform()
 
     def type_text(self, locator_type, locator, text: str):
         """Ye funtion input field me text ko fill karta hai or send karta hai."""
         self.logger.info(f"Typing text in element {locator}")
         try:
             element = self.wait.until(Ec.visibility_of_element_located((locator_type, locator)))  # ye function element ka tab tak wait karega jab tak ki element visibile na ho jaye ya timeout tak. until() bar bar funtion call karta hai or check karta  rahata hai.Isme arguments tuple ke form me bheje jate hai.
+            self._move_mouse_to_element(element)
             element.click()
-            sleep(5)
+            self._human_pause(*self.long_pause_range)
             self._send_multiline_text(element, text)
-            sleep(2)
+            self._human_pause()
         
         except Exception as e:
             self.logger.error(f"Failed to type text in element: {locator} message:{e}")
@@ -182,6 +431,7 @@ class ChatGptAutomation:
                         self.logger.info("Button DOM se gayab confirm ho gaya, ab next step run karenge.")
                         return True
                 sleep(poll_frequency)
+                self._background_mouse_wiggle()
 
             self.logger.warning(
                 "Button %s timeout %s sec ke baad bhi reliably gayab nahi hua, phir bhi aage badh rahe hain.",
@@ -243,11 +493,14 @@ class ChatGptAutomation:
                 return False
 
             last_element = elements[-1]
+            self._move_mouse_to_element(last_element)
+            self.logger.info("Pausing 5 seconds before download click")
+            self._human_pause(5.0, 5.0)
             self.action.move_to_element(last_element)\
             .pause(0.3)\
             .click()\
             .perform()
-            sleep(5)
+            self._human_pause(4.5, 6.8)
             return True
         except Exception as e:
             self.logger.error(f"Faild to download {e}")
@@ -264,9 +517,10 @@ class ChatGptAutomation:
             self.old_tab = self.driver.window_handles           # Iska use driver ko branch wali tab par le jane ke liye kiya hai.
 
             self.click_more_action_button(locator_type,more_action_button_xpath)
-            sleep(4)
+            self._human_pause(4.0, 6.5)
             self.logger.info(f"Clicking element {new_branch_button_selector}")
             branch_button = self.wait.until(Ec.visibility_of_element_located((locator_type, new_branch_button_selector)))
+            self._move_mouse_to_element(branch_button)
             branch_button.click()
 
             new_tabs = self.driver.window_handles
@@ -325,6 +579,86 @@ class ChatGptAutomation:
             pass
 
         return rendered
+
+    def _archive_refined_prompt(self, page_name: str, label: str, original: str, refined: str):
+        try:
+            self.prompt_archive_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+            base_name = Path(page_name).name or "unknown"
+            safe_name = "".join(
+                ch if ch.isalnum() or ch in ("-", "_") else "_"
+                for ch in base_name
+            ) or "page"
+            label = label or "prompt"
+            filename = f"{timestamp}_{safe_name}_{label}.md"
+            archive_path = self.prompt_archive_dir / filename
+            content = (
+                f"# Page: {page_name or 'unknown'}\n"
+                f"# Prompt Label: {label}\n"
+                f"# Timestamp (UTC): {timestamp}\n\n"
+                "## Original Prompt\n\n"
+                f"{original.strip()}\n\n"
+                "## Refined Prompt\n\n"
+                f"{refined.strip()}\n"
+            )
+            archive_path.write_text(content, encoding="utf-8")
+            return archive_path
+        except Exception as exc:
+            self.logger.warning("Prompt archive fail: %s", exc)
+        return None
+
+    def _refine_prompt(self, prompt_text: str, page_name: str, label: str) -> str:
+        if not prompt_text or not prompt_text.strip():
+            return prompt_text
+        if self.llm_client is None:
+            self.logger.warning("Prompt refiner disabled, using original text for %s", label)
+            self._archive_refined_prompt(page_name, label, prompt_text, prompt_text)
+            return prompt_text
+
+        instructions_parts = [
+            "Rewrite the provided automation prompt in natural Hinglish while preserving its exact intent,",
+            "required actions, placeholders, download instructions, and tone.",
+            "The new draft must stay concise, enterprise-grade, and produce the same output when sent to ChatGPT.",
+            "Do not add or remove requirements. Return only the rewritten prompt text.",
+        ]
+        instructions = " ".join(instructions_parts)
+
+        user_payload = (
+            f"Target page/file: {page_name or 'unknown'}\n"
+            "Original prompt:\n"
+            f"{prompt_text}\n\n"
+            "Rewrite it now."
+        )
+
+        try:
+            response = self.llm_client.chat.completions.create(
+                model=self.llm_deployment,
+                temperature=0.35,
+                max_tokens=min(600, max(200, int(len(prompt_text) * 1.3))),
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": user_payload},
+                ],
+            )
+
+            refined = (response.choices[0].message.content or "").strip()
+            if refined:
+                archive_path = self._archive_refined_prompt(page_name, label, prompt_text, refined)
+                if archive_path:
+                    self.logger.info(
+                        "Prompt refined via Azure OpenAI (%s) saved to %s",
+                        label,
+                        archive_path,
+                    )
+                else:
+                    self.logger.info("Prompt refined via Azure OpenAI (%s) [archive skipped]", label)
+                return refined
+        except Exception as exc:
+            self.logger.warning("Prompt refine skip (%s/%s): %s", page_name, label, exc)
+
+        # Even on failure archive original for forensic visibility
+        self._archive_refined_prompt(page_name, label, prompt_text, prompt_text)
+        return prompt_text
         
         
     def load_page_prompt(self):
@@ -474,15 +808,19 @@ class ChatGptAutomation:
         prompt1, prompt2, prompt3 = self.load_prompts()
         if not any([prompt1, prompt2, prompt3]):
             raise ValueError("Prompt templates missing in .Alien/Prompt")
-        return (
+        rendered = [
             self._render_prompt_template(prompt1, page_name),
             self._render_prompt_template(prompt2, page_name),
-            self._render_prompt_template(prompt3, page_name)
-        )
+            self._render_prompt_template(prompt3, page_name),
+        ]
+        labels = ["planning", "build", "doc"]
+        refined = [self._refine_prompt(text, page_name, labels[idx]) for idx, text in enumerate(rendered)]
+        return tuple(refined)
 
     def _process_page(self, page_name: str, send_button_locator, download_link_xpath) -> tuple[bool, str]:
         try:
             prompt1, prompt2, prompt3 = self._prepare_prompts(page_name)
+            self._update_snackbar(f"Ready: {page_name} plan prompt")
         except Exception as exc:
             self.logger.error("Prompt prepare faild for %s: %s", page_name, exc)
             return False, ""
@@ -492,27 +830,31 @@ class ChatGptAutomation:
 
         try:
             self.create_new_branch_switch_driver()
-            sleep(2)
+            self._human_pause(2.4, 4.6)
+            self._update_snackbar(f"{page_name}: Sending plan")
             self.type_text(By.XPATH, '//*[@id="prompt-textarea"]', prompt1)
-            sleep(2)
+            self._post_prompt_routine()
             self.check_response_complete(send_button_locator)
-            sleep(2)
+            self._human_pause(2.0, 3.6)
+            self._update_snackbar(f"{page_name}: Requesting build")
             self.type_text(By.XPATH, '//*[@id="prompt-textarea"]', prompt2)
-            sleep(2)
+            self._post_prompt_routine()
             self.check_response_complete(send_button_locator)
-            sleep(2)
+            self._human_pause(2.0, 3.6)
+            self._update_snackbar(f"{page_name}: Download prep")
             self.scroll_until_link_present(download_link_xpath)
-            sleep(2)
+            self._human_pause(1.8, 3.4)
             success = self.download_file() and success
-            sleep(2)
+            self._human_pause(2.7, 4.5)
+            self._update_snackbar(f"{page_name}: Final doc")
             self.type_text(By.XPATH, '//*[@id="prompt-textarea"]', prompt3)
-            sleep(2)
+            self._post_prompt_routine()
             self.check_response_complete(send_button_locator)
-            sleep(2)
+            self._human_pause(2.0, 3.6)
             self.scroll_until_link_present(download_link_xpath)
-            sleep(2)
+            self._human_pause(1.8, 3.4)
             success = self.download_file() and success
-            sleep(2)
+            self._human_pause(2.7, 4.5)
             try:
                 generated_url = self.driver.current_url
             except Exception:
@@ -520,6 +862,7 @@ class ChatGptAutomation:
         except Exception as exc:
             success = False
             self.logger.error("Processing faild for %s: %s", page_name, exc)
+            self._update_snackbar(f"{page_name}: Error, see logs")
         finally:
             try:
                 if len(self.driver.window_handles) > 1:
@@ -528,6 +871,10 @@ class ChatGptAutomation:
             except Exception:
                 pass
 
+        if success:
+            self._update_snackbar(f"{page_name}: Completed ✓")
+        else:
+            self._update_snackbar(f"{page_name}: Failed ✕")
         return success, generated_url
     
     def main(self):
@@ -565,6 +912,10 @@ class ChatGptAutomation:
         "ye function browser ko close karta hai."
         self.logger.info("Closing browser")
         self.driver.quit()   # Browser ko close karta hai
+        if hasattr(self, "snackbar") and self.snackbar:
+            self.snackbar.close()
+        if getattr(self, "snackbar_handler", None):
+            logging.getLogger().removeHandler(self.snackbar_handler)
 
 if __name__ == "__main__":
     url = CHAT_SESSION_URL

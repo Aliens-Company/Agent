@@ -15,19 +15,13 @@
 - `screen_capture2.py` – MSS + Pillow से स्क्रीनशॉट लेना और base64 एनकोड करना।
 - `text_input.py` – CLI के जरिए यूज़र कमांड लेना और डेस्कटॉप तैयार करना।
 - `action_execution2.py` – PyAutoGUI के जरिए किसी पॉइंट पर क्लिक करवाना।
-- `config.py` – `.Alien/Config/Agent.py` से secrets लोड करने वाला हल्का shim (फाइल खुद `.Alien` में रहती है)।
+- `config.py` – `.Alien/Config/Agent.py` से secrets लोड करने वाला हल्का shim (फाइल खुद `.Alien` में रहती है) और अब Azure OpenAI prompt refiner के लिए भी credentials यही से आते हैं।
 - `prompts.csv` / `aliens_school_webpages.json` – (legacy mention) अब इन्हें `.Alien` में रखा गया है ताकि Agent फ़ोल्डर रनटाइम में untouched रहे।
 - `todo.csv` / `todo.json` – प्रॉसेस किए गए पेजों की ट्रैकिंग; writable कॉपी `.Alien/ToDo/todo.csv` में रहती है।
 
 ## Shared `.Alien` resource hub
 
 ChatGPT ऑटोमेशन से जुड़ी हर editable/writable फ़ाइल अब sibling रिपॉज़िटरी `.Alien` में रहती है:
-
-- `.Alien/Config/Agent.py` – Azure / ChatGPT credentials और session URLs.
-- `.Alien/Prompt/Prompt1.md`, `Prompt2.md`, `Prompt3.md` – Markdown टेम्पलेट्स जिनमें `{{FILE_PATH}}` और `{{FILE_NAME}}` placeholders हैं।
-- `.Alien/Prompt/aliens_school_webpages.json` (optional) – seed list जिससे पहली बार TODO CSV बन सकती है।
-- `.Alien/ToDo/todo.csv` – Chrome ऑटोमेशन की प्रगति ट्रैक करने वाली फाइल (status 0/1/2, download URL कॉलम)।
-- `.Alien/Logs/GptBot.log` – Selenium रन के दौरान बनने वाली log फाइल।
 
 > ChatGPT.py अब `.Alien` को auto-detect करके वहीँ read/write करता है, इसलिए एजेंट फ़ोल्डर में कोई runtime mutation नहीं होता।
 
@@ -62,7 +56,7 @@ pip install -r requirements.txt
 
 1. Selenium Chrome से ChatGPT conversation पेज खोलता है।
 2. `.Alien/ToDo/todo.csv` से अगला pending file path (page_name) उठाया जाता है। पहली रन पर यह फाइल `.Alien/Prompt/aliens_school_webpages.json` या legacy JSON से seed हो सकती है।
-3. हर पेज के लिए `.Alien/Prompt/Prompt1.md`, `Prompt2.md`, `Prompt3.md` Markdown टेम्पलेट लोड होते हैं:
+3. हर पेज के लिए `.Alien/Prompt/Prompt1.md`, `Prompt2.md`, `Prompt3.md` Markdown टेम्पलेट लोड होते हैं और Azure OpenAI (same creds as `.Alien/Config/Agent.py`) उन्हें हल्के से paraphrase कर देता है ताकि ChatGPT pattern detect न करे — rewritten कॉपी `.Alien/Prompts/` में भी सेव होती है।
 	- प्रॉम्प्ट 1: detailed planning
 	- प्रॉम्प्ट 2: downloadable कोड
 	- प्रॉम्प्ट 3: वैकल्पिक/अतिरिक्त आउटपुट (फाइल डाउनलोड का दूसरा प्रयास)
@@ -111,6 +105,7 @@ python main.py
 
 - `.Alien/Prompt/aliens_school_webpages.json` – optional key/value seed list; हर value एक file path है।
 - `.Alien/Prompt/Prompt1.md` / `Prompt2.md` / `Prompt3.md` – Markdown टेम्पलेट्स जिनमें `{{FILE_PATH}}`, `{{FILE_NAME}}`, `{page_name}` placeholders मिलते हैं।
+- `.Alien/Prompts/` – Azure refiner से निकली हर rewritten prompt का timestamped `.md` आर्काइव (audit/debug के लिए)।
 - `.Alien/ToDo/todo.csv` – `status` (`0` pending, `1` success, `2` failed) और `url` कॉलम; रनटाइम में सिर्फ यही फाइल mutate होती है।
 
 ## ट्रबलशूटिंग
