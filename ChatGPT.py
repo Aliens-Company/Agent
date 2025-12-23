@@ -36,7 +36,7 @@ from config import (
 
 
 BASE_DIR = Path(__file__).resolve().parent
-ALIEN_ROOT = BASE_DIR.parent / ".Alien"
+ALIEN_ROOT = BASE_DIR.parent / ".Alien/C0101"
 PROMPT_DIR = ALIEN_ROOT / "Prompt"
 PROMPT_ARCHIVE_DIR = ALIEN_ROOT / "Prompts"
 TODO_DIR = ALIEN_ROOT / "ToDo"
