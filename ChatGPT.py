@@ -545,6 +545,24 @@ class ChatGptAutomation:
         except Exception as e:
             self.logger.error(f"Faild to download {e}")
             return False
+
+    def download_with_retry(self, link_xpath: str, retry_wait: float = 10.0) -> bool:
+        """Ensures download retry after prompt submission without losing scroll state."""
+        self.scroll_until_link_present(link_xpath)
+        self._human_pause(1.8, 3.4)
+        if self.download_file():
+            return True
+
+        self.logger.warning("Download attempt failed, retrying after %s seconds.", retry_wait)
+        self._human_pause(retry_wait, retry_wait)
+        try:
+            self._scroll_to_bottom()
+        except Exception as exc:
+            self.logger.debug("Scroll to bottom failed during retry: %s", exc)
+
+        self.scroll_until_link_present(link_xpath)
+        self._human_pause(1.0, 2.0)
+        return self.download_file()
   
     def create_new_branch_switch_driver(self):
         """Ye function new branch create karta hai or sath me driver ko main chat se brach wali chat pe switch karta hai"""
@@ -842,7 +860,11 @@ class ChatGptAutomation:
         if legacy_status is None:
             legacy_status = row.get("status")
         if legacy_status is not None:
-            normalized["complete_status"] = "1" if str(legacy_status).strip() == "1" else "0"
+            status_value = str(legacy_status).strip()
+            if status_value in {"1", "2"}:
+                normalized["complete_status"] = status_value
+            else:
+                normalized["complete_status"] = "0"
 
         for column in STEP_STATUS_COLUMNS:
             value = row.get(column)
@@ -913,7 +935,9 @@ class ChatGptAutomation:
             self._update_snackbar(f"Ready: {page_name} plan prompt")
         except Exception as exc:
             self.logger.error("Prompt prepare faild for %s: %s", page_name, exc)
-            return False, "", {column: "0" for column in STEP_STATUS_COLUMNS + ["complete_status"]}
+            failure_status = {column: "0" for column in STEP_STATUS_COLUMNS}
+            failure_status["complete_status"] = "2"
+            return False, "", failure_status
 
         success = True
         generated_url = ""
@@ -947,9 +971,7 @@ class ChatGptAutomation:
 
             if self._should_run_step("download1"):
                 self._update_snackbar(f"{page_name}: Download prep")
-                self.scroll_until_link_present(download_link_xpath)
-                self._human_pause(1.8, 3.4)
-                download_success = self.download_file()
+                download_success = self.download_with_retry(download_link_xpath)
                 step_status["code_download"] = "1" if download_success else "0"
                 success = download_success and success
                 self._human_pause(2.7, 4.5)
@@ -969,9 +991,7 @@ class ChatGptAutomation:
                 self._update_snackbar(f"{page_name}: Prompt3 bypassed")
 
             if self._should_run_step("download2"):
-                self.scroll_until_link_present(download_link_xpath)
-                self._human_pause(1.8, 3.4)
-                download_success = self.download_file()
+                download_success = self.download_with_retry(download_link_xpath)
                 step_status["docs_download"] = "1" if download_success else "0"
                 success = download_success and success
                 self._human_pause(2.7, 4.5)
@@ -998,7 +1018,7 @@ class ChatGptAutomation:
             self._update_snackbar(f"{page_name}: Completed ✓")
         else:
             self._update_snackbar(f"{page_name}: Failed ✕")
-        step_status["complete_status"] = "1" if success else "0"
+        step_status["complete_status"] = "1" if success else "2"
         return success, generated_url, step_status
     
     def main(self):
@@ -1017,7 +1037,7 @@ class ChatGptAutomation:
             if not page_name:
                 self.logger.error("Task me page name missing hai, status failed mark kar rahe hain.")
                 if index is not None:
-                    rows[index]["complete_status"] = "0"
+                    rows[index]["complete_status"] = "2"
                     self._write_tasks(csv_path, rows, fieldnames)
                 continue
 
@@ -1027,7 +1047,7 @@ class ChatGptAutomation:
             if index is not None:
                 for column in STEP_STATUS_COLUMNS:
                     rows[index][column] = step_status.get(column, rows[index].get(column, "0"))
-                rows[index]["complete_status"] = step_status.get("complete_status", "1" if success else "0")
+                rows[index]["complete_status"] = step_status.get("complete_status", "1" if success else "2")
                 if generated_url:
                     rows[index]["url"] = generated_url
                 self._write_tasks(csv_path, rows, fieldnames)
