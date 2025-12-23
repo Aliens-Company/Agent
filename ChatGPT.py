@@ -192,8 +192,6 @@ class ChatGptAutomation:
         self.llm_deployment = LLM_DEPLOYMENT
         self.snackbar = SystemSnackbar("Agent init in progress…")
         self.flow_control = dict(FLOW_CONTROL)
-        self._auto_scroll_stop = threading.Event()
-        self._auto_scroll_thread: Optional[threading.Thread] = None
 
         self._setup_logging()
         self.logger.info("Initializing GptBot....")
@@ -225,7 +223,6 @@ class ChatGptAutomation:
         self.driver.maximize_window()                                                      # window size ko maximize karta hai.
         self.action = ActionChains(self.driver)
         self.wait = WebDriverWait(self.driver, 40)
-        self._start_auto_scroll()
 
     def _setup_logging(self):            # ye ek private function hai logging setup ke liye.
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -329,28 +326,11 @@ class ChatGptAutomation:
         except Exception as exc:
             self.logger.debug("Mouse wiggle skip: %s", exc)
 
-    def _auto_scroll_loop(self):
-        while not self._auto_scroll_stop.is_set():
-            try:
-                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            except Exception as exc:
-                self.logger.debug("Auto scroll skip: %s", exc)
-            if self._auto_scroll_stop.wait(2.0):
-                break
-
-    def _start_auto_scroll(self):
-        if self._auto_scroll_thread and self._auto_scroll_thread.is_alive():
-            return
-        self._auto_scroll_stop.clear()
-        self._auto_scroll_thread = threading.Thread(target=self._auto_scroll_loop, daemon=True)
-        self._auto_scroll_thread.start()
-
-    def _stop_auto_scroll(self):
-        if not self._auto_scroll_thread:
-            return
-        self._auto_scroll_stop.set()
-        self._auto_scroll_thread.join(timeout=2.5)
-        self._auto_scroll_thread = None
+    def _scroll_to_bottom(self):
+        try:
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        except Exception as exc:
+            self.logger.debug("Scroll to bottom skip: %s", exc)
 
     def _move_mouse(self, x: float, y: float, jitter: float = 18.0):
         try:
@@ -466,10 +446,15 @@ class ChatGptAutomation:
 
         absence_streak = 0
         start_time = time()
+        last_scroll = 0.0
 
         try:
             while time() - start_time <= timeout:
                 element_present = bool(self.driver.find_elements(*send_button_locator))
+                now = time()
+                if element_present and (now - last_scroll) >= 2.0:
+                    self._scroll_to_bottom()
+                    last_scroll = now
                 if element_present:
                     if absence_streak:
                         self.logger.debug("Button wapas DOM me aagya, streak reset.")
@@ -560,6 +545,24 @@ class ChatGptAutomation:
         except Exception as e:
             self.logger.error(f"Faild to download {e}")
             return False
+
+    def download_with_retry(self, link_xpath: str, retry_wait: float = 10.0) -> bool:
+        """Ensures download retry after prompt submission without losing scroll state."""
+        self.scroll_until_link_present(link_xpath)
+        self._human_pause(1.8, 3.4)
+        if self.download_file():
+            return True
+
+        self.logger.warning("Download attempt failed, retrying after %s seconds.", retry_wait)
+        self._human_pause(retry_wait, retry_wait)
+        try:
+            self._scroll_to_bottom()
+        except Exception as exc:
+            self.logger.debug("Scroll to bottom failed during retry: %s", exc)
+
+        self.scroll_until_link_present(link_xpath)
+        self._human_pause(1.0, 2.0)
+        return self.download_file()
   
     def create_new_branch_switch_driver(self):
         """Ye function new branch create karta hai or sath me driver ko main chat se brach wali chat pe switch karta hai"""
@@ -857,7 +860,11 @@ class ChatGptAutomation:
         if legacy_status is None:
             legacy_status = row.get("status")
         if legacy_status is not None:
-            normalized["complete_status"] = "1" if str(legacy_status).strip() == "1" else "0"
+            status_value = str(legacy_status).strip()
+            if status_value in {"1", "2"}:
+                normalized["complete_status"] = status_value
+            else:
+                normalized["complete_status"] = "0"
 
         for column in STEP_STATUS_COLUMNS:
             value = row.get(column)
@@ -928,7 +935,9 @@ class ChatGptAutomation:
             self._update_snackbar(f"Ready: {page_name} plan prompt")
         except Exception as exc:
             self.logger.error("Prompt prepare faild for %s: %s", page_name, exc)
-            return False, "", {column: "0" for column in STEP_STATUS_COLUMNS + ["complete_status"]}
+            failure_status = {column: "0" for column in STEP_STATUS_COLUMNS}
+            failure_status["complete_status"] = "2"
+            return False, "", failure_status
 
         success = True
         generated_url = ""
@@ -962,9 +971,7 @@ class ChatGptAutomation:
 
             if self._should_run_step("download1"):
                 self._update_snackbar(f"{page_name}: Download prep")
-                self.scroll_until_link_present(download_link_xpath)
-                self._human_pause(1.8, 3.4)
-                download_success = self.download_file()
+                download_success = self.download_with_retry(download_link_xpath)
                 step_status["code_download"] = "1" if download_success else "0"
                 success = download_success and success
                 self._human_pause(2.7, 4.5)
@@ -984,9 +991,7 @@ class ChatGptAutomation:
                 self._update_snackbar(f"{page_name}: Prompt3 bypassed")
 
             if self._should_run_step("download2"):
-                self.scroll_until_link_present(download_link_xpath)
-                self._human_pause(1.8, 3.4)
-                download_success = self.download_file()
+                download_success = self.download_with_retry(download_link_xpath)
                 step_status["docs_download"] = "1" if download_success else "0"
                 success = download_success and success
                 self._human_pause(2.7, 4.5)
@@ -1013,7 +1018,7 @@ class ChatGptAutomation:
             self._update_snackbar(f"{page_name}: Completed ✓")
         else:
             self._update_snackbar(f"{page_name}: Failed ✕")
-        step_status["complete_status"] = "1" if success else "0"
+        step_status["complete_status"] = "1" if success else "2"
         return success, generated_url, step_status
     
     def main(self):
@@ -1032,7 +1037,7 @@ class ChatGptAutomation:
             if not page_name:
                 self.logger.error("Task me page name missing hai, status failed mark kar rahe hain.")
                 if index is not None:
-                    rows[index]["complete_status"] = "0"
+                    rows[index]["complete_status"] = "2"
                     self._write_tasks(csv_path, rows, fieldnames)
                 continue
 
@@ -1042,7 +1047,7 @@ class ChatGptAutomation:
             if index is not None:
                 for column in STEP_STATUS_COLUMNS:
                     rows[index][column] = step_status.get(column, rows[index].get(column, "0"))
-                rows[index]["complete_status"] = step_status.get("complete_status", "1" if success else "0")
+                rows[index]["complete_status"] = step_status.get("complete_status", "1" if success else "2")
                 if generated_url:
                     rows[index]["url"] = generated_url
                 self._write_tasks(csv_path, rows, fieldnames)
@@ -1052,7 +1057,6 @@ class ChatGptAutomation:
     def close(self):
         "ye function browser ko close karta hai."
         self.logger.info("Closing browser")
-        self._stop_auto_scroll()
         self.driver.quit()   # Browser ko close karta hai
         if hasattr(self, "snackbar") and self.snackbar:
             self.snackbar.close()
