@@ -31,11 +31,12 @@ from config import (
     AZURE_ENDPOINT,
     AZURE_API_VERSION,
     LLM_DEPLOYMENT,
+    FLOW_CONTROL,
 )
 
 
 BASE_DIR = Path(__file__).resolve().parent
-ALIEN_ROOT = BASE_DIR.parent / ".Alien"
+ALIEN_ROOT = BASE_DIR.parent / ".Alien/C0101"
 PROMPT_DIR = ALIEN_ROOT / "Prompt"
 PROMPT_ARCHIVE_DIR = ALIEN_ROOT / "Prompts"
 TODO_DIR = ALIEN_ROOT / "ToDo"
@@ -59,6 +60,24 @@ WEBPAGE_JSON_CANDIDATES = [
     BASE_DIR / "aliens_school_webpages.json",
 ]
 LOG_FILE_PATH = LOG_DIR / "GptBot.log"
+TASK_FIELDNAMES = [
+    "id",
+    "page_name",
+    "planning",
+    "code_generate",
+    "code_download",
+    "docs_generate",
+    "docs_download",
+    "complete_status",
+    "url",
+]
+STEP_STATUS_COLUMNS = [
+    "planning",
+    "code_generate",
+    "code_download",
+    "docs_generate",
+    "docs_download",
+]
 
 
 class SystemSnackbar:
@@ -172,6 +191,9 @@ class ChatGptAutomation:
         self.llm_client = None
         self.llm_deployment = LLM_DEPLOYMENT
         self.snackbar = SystemSnackbar("Agent init in progress…")
+        self.flow_control = dict(FLOW_CONTROL)
+        self._auto_scroll_stop = threading.Event()
+        self._auto_scroll_thread: Optional[threading.Thread] = None
 
         self._setup_logging()
         self.logger.info("Initializing GptBot....")
@@ -203,6 +225,7 @@ class ChatGptAutomation:
         self.driver.maximize_window()                                                      # window size ko maximize karta hai.
         self.action = ActionChains(self.driver)
         self.wait = WebDriverWait(self.driver, 40)
+        self._start_auto_scroll()
 
     def _setup_logging(self):            # ye ek private function hai logging setup ke liye.
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -237,6 +260,15 @@ class ChatGptAutomation:
         except Exception as exc:
             self.llm_client = None
             self.logger.warning("Prompt refiner init fail: %s", exc)
+
+    def _should_run_step(self, step_id: str) -> bool:
+        """Check flow-control flag for the given step."""
+        value = self.flow_control.get(step_id, 1)
+        try:
+            return bool(int(value))
+        except (TypeError, ValueError):
+            self.logger.debug("Flow flag invalid for %s (value=%s), default run", step_id, value)
+            return True
 
     def _human_pause(self, minimum=None, maximum=None):
         """Har action ke beech human-like random delay add karta hai."""
@@ -296,6 +328,29 @@ class ChatGptAutomation:
             pyautogui.moveTo(target_x, target_y, duration=duration)
         except Exception as exc:
             self.logger.debug("Mouse wiggle skip: %s", exc)
+
+    def _auto_scroll_loop(self):
+        while not self._auto_scroll_stop.is_set():
+            try:
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            except Exception as exc:
+                self.logger.debug("Auto scroll skip: %s", exc)
+            if self._auto_scroll_stop.wait(2.0):
+                break
+
+    def _start_auto_scroll(self):
+        if self._auto_scroll_thread and self._auto_scroll_thread.is_alive():
+            return
+        self._auto_scroll_stop.clear()
+        self._auto_scroll_thread = threading.Thread(target=self._auto_scroll_loop, daemon=True)
+        self._auto_scroll_thread.start()
+
+    def _stop_auto_scroll(self):
+        if not self._auto_scroll_thread:
+            return
+        self._auto_scroll_stop.set()
+        self._auto_scroll_thread.join(timeout=2.5)
+        self._auto_scroll_thread = None
 
     def _move_mouse(self, x: float, y: float, jitter: float = 18.0):
         try:
@@ -739,16 +794,20 @@ class ChatGptAutomation:
 
     def _ensure_tasks_csv(self) -> Path:
         csv_path = self.todo_csv_path
-        if csv_path.exists():
-            return csv_path
-
         csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if self.legacy_todo_csv_path.exists():
-            shutil.copy2(self.legacy_todo_csv_path, csv_path)
-            self.logger.info("Legacy todo CSV migrated to %s", csv_path)
-            return csv_path
+        if not csv_path.exists():
+            if self.legacy_todo_csv_path.exists():
+                shutil.copy2(self.legacy_todo_csv_path, csv_path)
+                self.logger.info("Legacy todo CSV migrated to %s", csv_path)
+            else:
+                self._seed_tasks_csv(csv_path)
 
+        # Normalize legacy structures into the expanded schema
+        self._normalize_task_file(csv_path)
+        return csv_path
+
+    def _seed_tasks_csv(self, csv_path: Path):
         seed_json = self._find_existing_path(self.todo_seed_candidates)
         if not seed_json:
             raise FileNotFoundError(
@@ -758,9 +817,8 @@ class ChatGptAutomation:
         with open(seed_json, "r", encoding="utf-8") as file:
             data = json.load(file)
 
-        fieldnames = ["id", "page_name", "status", "url"]
         with open(csv_path, "w", encoding="utf-8", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer = csv.DictWriter(file, fieldnames=TASK_FIELDNAMES)
             writer.writeheader()
 
             items = data.items() if isinstance(data, dict) else enumerate(data, start=1)
@@ -769,38 +827,85 @@ class ChatGptAutomation:
                     page_name = value.get("page_name") or value.get("name") or value.get("title") or ""
                 else:
                     page_name = value
-                writer.writerow({"id": key, "page_name": page_name, "status": "0", "url": ""})
+                writer.writerow(self._build_task_row(key, page_name))
 
         self.logger.info("CSV task list create ki gayi %s se", csv_path)
-        return csv_path
+
+    def _normalize_task_file(self, csv_path: Path):
+        rows, _ = self._read_tasks(csv_path)
+        # _read_tasks already rewrites if needed, so no-op here beyond ensuring read succeeds
+        return rows
+
+    def _build_task_row(self, identifier, page_name, url: str = ""):
+        row = {column: "0" for column in TASK_FIELDNAMES}
+        row["id"] = str(identifier)
+        row["page_name"] = page_name or ""
+        row["url"] = url or ""
+        return row
+
+    def _normalize_task_row(self, row: dict, fallback_id: int) -> dict:
+        normalized = {column: "0" for column in TASK_FIELDNAMES}
+        identifier = (row.get("id") or "").strip()
+        if not identifier:
+            identifier = str(fallback_id)
+        normalized["id"] = identifier
+        normalized["page_name"] = (row.get("page_name") or "").strip()
+        normalized["url"] = (row.get("url") or "").strip()
+
+        # Map legacy status/complete indicators
+        legacy_status = row.get("complete_status")
+        if legacy_status is None:
+            legacy_status = row.get("status")
+        if legacy_status is not None:
+            normalized["complete_status"] = "1" if str(legacy_status).strip() == "1" else "0"
+
+        for column in STEP_STATUS_COLUMNS:
+            value = row.get(column)
+            if value is not None and str(value).strip() == "1":
+                normalized[column] = "1"
+
+        return normalized
 
     def _read_tasks(self, csv_path: Path):
         with open(csv_path, "r", encoding="utf-8", newline="") as file:
             reader = csv.DictReader(file)
-            rows = list(reader)
-            fieldnames = reader.fieldnames or ["id", "page_name", "status", "url"]
+            raw_rows = list(reader)
+            original_fieldnames = reader.fieldnames or []
 
-        # ensure url column exists even in older CSVs
-        if "url" not in fieldnames:
-            fieldnames = ["id", "page_name", "status", "url"]
-            for row in rows:
-                row.setdefault("url", "")
-            self._write_tasks(csv_path, rows, fieldnames)
+        needs_write = original_fieldnames != TASK_FIELDNAMES
+        rows = []
+        for idx, raw in enumerate(raw_rows, start=1):
+            normalized = self._normalize_task_row(raw, idx)
+            rows.append(normalized)
+            if not needs_write:
+                for column in TASK_FIELDNAMES:
+                    original_value = (raw.get(column) or "").strip()
+                    if original_value != normalized[column]:
+                        needs_write = True
+                        break
+                if not needs_write:
+                    extra_keys = set(raw.keys()) - set(TASK_FIELDNAMES)
+                    if extra_keys:
+                        needs_write = True
 
-        return rows, fieldnames
+        if needs_write:
+            self._write_tasks(csv_path, rows, TASK_FIELDNAMES)
 
-    def _write_tasks(self, csv_path: Path, rows, fieldnames):
+        return rows, TASK_FIELDNAMES
+
+    def _write_tasks(self, csv_path: Path, rows, fieldnames=None):
         csv_path.parent.mkdir(parents=True, exist_ok=True)
+        active_fields = fieldnames or TASK_FIELDNAMES
         with open(csv_path, "w", encoding="utf-8", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer = csv.DictWriter(file, fieldnames=active_fields)
             writer.writeheader()
             writer.writerows(rows)
 
     def _get_next_pending_task(self, csv_path: Path):
         rows, fieldnames = self._read_tasks(csv_path)
         for index, row in enumerate(rows):
-            status = row.get("status", "0").strip()
-            if status == "0":
+            status = row.get("complete_status") or row.get("status") or "0"
+            if status.strip() == "0":
                 return row, rows, index, fieldnames
         return None, rows, None, fieldnames
 
@@ -817,44 +922,77 @@ class ChatGptAutomation:
         refined = [self._refine_prompt(text, page_name, labels[idx]) for idx, text in enumerate(rendered)]
         return tuple(refined)
 
-    def _process_page(self, page_name: str, send_button_locator, download_link_xpath) -> tuple[bool, str]:
+    def _process_page(self, page_name: str, send_button_locator, download_link_xpath) -> tuple[bool, str, dict]:
         try:
             prompt1, prompt2, prompt3 = self._prepare_prompts(page_name)
             self._update_snackbar(f"Ready: {page_name} plan prompt")
         except Exception as exc:
             self.logger.error("Prompt prepare faild for %s: %s", page_name, exc)
-            return False, ""
+            return False, "", {column: "0" for column in STEP_STATUS_COLUMNS + ["complete_status"]}
 
         success = True
         generated_url = ""
+        step_status = {column: "0" for column in STEP_STATUS_COLUMNS}
+        step_status["complete_status"] = "0"
 
         try:
             self.create_new_branch_switch_driver()
             self._human_pause(2.4, 4.6)
-            self._update_snackbar(f"{page_name}: Sending plan")
-            self.type_text(By.XPATH, '//*[@id="prompt-textarea"]', prompt1)
-            self._post_prompt_routine()
-            self.check_response_complete(send_button_locator)
-            self._human_pause(2.0, 3.6)
-            self._update_snackbar(f"{page_name}: Requesting build")
-            self.type_text(By.XPATH, '//*[@id="prompt-textarea"]', prompt2)
-            self._post_prompt_routine()
-            self.check_response_complete(send_button_locator)
-            self._human_pause(2.0, 3.6)
-            self._update_snackbar(f"{page_name}: Download prep")
-            self.scroll_until_link_present(download_link_xpath)
-            self._human_pause(1.8, 3.4)
-            success = self.download_file() and success
-            self._human_pause(2.7, 4.5)
-            self._update_snackbar(f"{page_name}: Final doc")
-            self.type_text(By.XPATH, '//*[@id="prompt-textarea"]', prompt3)
-            self._post_prompt_routine()
-            self.check_response_complete(send_button_locator)
-            self._human_pause(2.0, 3.6)
-            self.scroll_until_link_present(download_link_xpath)
-            self._human_pause(1.8, 3.4)
-            success = self.download_file() and success
-            self._human_pause(2.7, 4.5)
+            if self._should_run_step("prompt1"):
+                self._update_snackbar(f"{page_name}: Sending plan")
+                self.type_text(By.XPATH, '//*[@id="prompt-textarea"]', prompt1)
+                self._post_prompt_routine()
+                self.check_response_complete(send_button_locator)
+                self._human_pause(2.0, 3.6)
+                step_status["planning"] = "1"
+            else:
+                self.logger.info("Prompt1 bypassed for %s", page_name)
+                self._update_snackbar(f"{page_name}: Prompt1 bypassed")
+
+            if self._should_run_step("prompt2"):
+                self._update_snackbar(f"{page_name}: Requesting build")
+                self.type_text(By.XPATH, '//*[@id="prompt-textarea"]', prompt2)
+                self._post_prompt_routine()
+                self.check_response_complete(send_button_locator)
+                self._human_pause(2.0, 3.6)
+                step_status["code_generate"] = "1"
+            else:
+                self.logger.info("Prompt2 bypassed for %s", page_name)
+                self._update_snackbar(f"{page_name}: Prompt2 bypassed")
+
+            if self._should_run_step("download1"):
+                self._update_snackbar(f"{page_name}: Download prep")
+                self.scroll_until_link_present(download_link_xpath)
+                self._human_pause(1.8, 3.4)
+                download_success = self.download_file()
+                step_status["code_download"] = "1" if download_success else "0"
+                success = download_success and success
+                self._human_pause(2.7, 4.5)
+            else:
+                self.logger.info("Download1 bypassed for %s", page_name)
+                self._update_snackbar(f"{page_name}: Download1 bypassed")
+
+            if self._should_run_step("prompt3"):
+                self._update_snackbar(f"{page_name}: Final doc")
+                self.type_text(By.XPATH, '//*[@id="prompt-textarea"]', prompt3)
+                self._post_prompt_routine()
+                self.check_response_complete(send_button_locator)
+                self._human_pause(2.0, 3.6)
+                step_status["docs_generate"] = "1"
+            else:
+                self.logger.info("Prompt3 bypassed for %s", page_name)
+                self._update_snackbar(f"{page_name}: Prompt3 bypassed")
+
+            if self._should_run_step("download2"):
+                self.scroll_until_link_present(download_link_xpath)
+                self._human_pause(1.8, 3.4)
+                download_success = self.download_file()
+                step_status["docs_download"] = "1" if download_success else "0"
+                success = download_success and success
+                self._human_pause(2.7, 4.5)
+            else:
+                self.logger.info("Download2 bypassed for %s", page_name)
+                self._update_snackbar(f"{page_name}: Download2 bypassed")
             try:
                 generated_url = self.driver.current_url
             except Exception:
@@ -875,7 +1013,8 @@ class ChatGptAutomation:
             self._update_snackbar(f"{page_name}: Completed ✓")
         else:
             self._update_snackbar(f"{page_name}: Failed ✕")
-        return success, generated_url
+        step_status["complete_status"] = "1" if success else "0"
+        return success, generated_url, step_status
     
     def main(self):
         """Is function me baki sare funtion call kiye hai loop ke satha me yhi branch create, text type, Respose wait, Scroll or file download ka function call kiye hai or last me driver ko vapas main chat par switch kiya hai."""
@@ -893,15 +1032,17 @@ class ChatGptAutomation:
             if not page_name:
                 self.logger.error("Task me page name missing hai, status failed mark kar rahe hain.")
                 if index is not None:
-                    rows[index]["status"] = "2"
+                    rows[index]["complete_status"] = "0"
                     self._write_tasks(csv_path, rows, fieldnames)
                 continue
 
             self.logger.info("Processing page: %s", page_name)
-            success, generated_url = self._process_page(page_name, send_button_locator, download_link_xpath)
+            success, generated_url, step_status = self._process_page(page_name, send_button_locator, download_link_xpath)
 
             if index is not None:
-                rows[index]["status"] = "1" if success else "2"
+                for column in STEP_STATUS_COLUMNS:
+                    rows[index][column] = step_status.get(column, rows[index].get(column, "0"))
+                rows[index]["complete_status"] = step_status.get("complete_status", "1" if success else "0")
                 if generated_url:
                     rows[index]["url"] = generated_url
                 self._write_tasks(csv_path, rows, fieldnames)
@@ -911,6 +1052,7 @@ class ChatGptAutomation:
     def close(self):
         "ye function browser ko close karta hai."
         self.logger.info("Closing browser")
+        self._stop_auto_scroll()
         self.driver.quit()   # Browser ko close karta hai
         if hasattr(self, "snackbar") and self.snackbar:
             self.snackbar.close()
