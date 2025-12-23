@@ -192,8 +192,6 @@ class ChatGptAutomation:
         self.llm_deployment = LLM_DEPLOYMENT
         self.snackbar = SystemSnackbar("Agent init in progress…")
         self.flow_control = dict(FLOW_CONTROL)
-        self._auto_scroll_stop = threading.Event()
-        self._auto_scroll_thread: Optional[threading.Thread] = None
 
         self._setup_logging()
         self.logger.info("Initializing GptBot....")
@@ -225,7 +223,6 @@ class ChatGptAutomation:
         self.driver.maximize_window()                                                      # window size ko maximize karta hai.
         self.action = ActionChains(self.driver)
         self.wait = WebDriverWait(self.driver, 40)
-        self._start_auto_scroll()
 
     def _setup_logging(self):            # ye ek private function hai logging setup ke liye.
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -329,28 +326,11 @@ class ChatGptAutomation:
         except Exception as exc:
             self.logger.debug("Mouse wiggle skip: %s", exc)
 
-    def _auto_scroll_loop(self):
-        while not self._auto_scroll_stop.is_set():
-            try:
-                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            except Exception as exc:
-                self.logger.debug("Auto scroll skip: %s", exc)
-            if self._auto_scroll_stop.wait(2.0):
-                break
-
-    def _start_auto_scroll(self):
-        if self._auto_scroll_thread and self._auto_scroll_thread.is_alive():
-            return
-        self._auto_scroll_stop.clear()
-        self._auto_scroll_thread = threading.Thread(target=self._auto_scroll_loop, daemon=True)
-        self._auto_scroll_thread.start()
-
-    def _stop_auto_scroll(self):
-        if not self._auto_scroll_thread:
-            return
-        self._auto_scroll_stop.set()
-        self._auto_scroll_thread.join(timeout=2.5)
-        self._auto_scroll_thread = None
+    def _scroll_to_bottom(self):
+        try:
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        except Exception as exc:
+            self.logger.debug("Scroll to bottom skip: %s", exc)
 
     def _move_mouse(self, x: float, y: float, jitter: float = 18.0):
         try:
@@ -466,10 +446,15 @@ class ChatGptAutomation:
 
         absence_streak = 0
         start_time = time()
+        last_scroll = 0.0
 
         try:
             while time() - start_time <= timeout:
                 element_present = bool(self.driver.find_elements(*send_button_locator))
+                now = time()
+                if element_present and (now - last_scroll) >= 2.0:
+                    self._scroll_to_bottom()
+                    last_scroll = now
                 if element_present:
                     if absence_streak:
                         self.logger.debug("Button wapas DOM me aagya, streak reset.")
@@ -1052,7 +1037,6 @@ class ChatGptAutomation:
     def close(self):
         "ye function browser ko close karta hai."
         self.logger.info("Closing browser")
-        self._stop_auto_scroll()
         self.driver.quit()   # Browser ko close karta hai
         if hasattr(self, "snackbar") and self.snackbar:
             self.snackbar.close()
