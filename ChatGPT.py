@@ -79,6 +79,11 @@ STEP_STATUS_COLUMNS = [
     "docs_download",
 ]
 
+DOWNLOAD_LINK_XPATHS = (
+    '//a[contains(normalize-space(.), "Download")]',
+    '//a[starts-with(normalize-space(.), "sandbox:/mnt/data/")]'
+)
+
 
 class SystemSnackbar:
     """Lightweight top-right overlay to show automation status."""
@@ -437,7 +442,7 @@ class ChatGptAutomation:
     def check_response_complete(
         self,
         send_button_locator,
-        timeout: int = 180,
+        timeout: int = 600,
         poll_frequency: float = 1.0,
         confirmations_required: int = 2
     ):
@@ -486,71 +491,83 @@ class ChatGptAutomation:
 
     def scroll_until_link_present(
         self,
-        link_xpath: str,
+        link_xpaths,
         max_scrolls: int = 40,
         scroll_pause: float = 0.5
     ):
-        """ Ye function second prompt ke send karne ke bad me call hoga or jaise hi ise download link dikhega ye page ko end tak scroll kar dega."""
-    
+        """Second prompt ke baad download link ko locate karne ke liye scroll karta hai."""
+
+        if isinstance(link_xpaths, str):
+            link_xpaths = [link_xpaths]
+
         for scroll_count in range(max_scrolls):
-            try:
-                # STEP 1: DOM presence check
-                link = self.driver.find_element(By.XPATH, link_xpath)
+            for xpath in link_xpaths:
+                try:
+                    link = self.driver.find_element(By.XPATH, xpath)
+                    self.logger.info("Download link found via pattern: %s", xpath)
+                    if link.is_displayed():
+                        scroll_div = self.driver.find_element(By.TAG_NAME, 'body')
+                        scroll_div.click()
+                        scroll_div.send_keys(Keys.END)
+                        return link
+                except NoSuchElementException:
+                    continue
 
-                self.logger.info(
-                    "Target link found in DOM. Scrolling to bottom."
-                )
-                if link.is_displayed():
-                    scroll_div = self.driver.find_element(By.TAG_NAME, 'body')
-                    scroll_div.click()
-                    scroll_div.send_keys(Keys.END)
-
-                    return link
-
-            except NoSuchElementException:
-                self.logger.debug(
-                    f"Scrolling attempt {scroll_count + 1}"
-                )
-                sleep(scroll_pause)
+            self.logger.debug("Scrolling attempt %s", scroll_count + 1)
+            sleep(scroll_pause)
 
         self.logger.warning(
-        "Target link not found after max scroll attempts. Continuing execution."
-    )
+            "Target link not found after max scroll attempts. Continuing execution."
+        )
         return None
 
-    def download_file(self):
+    def download_file(self, link_xpaths) -> bool:
         """Ye function file download link par click karta hai or file download karta hai."""
-        locator_type = By.XPATH
-        locator = '//a[contains(normalize-space(.), "Download")]'
+        if isinstance(link_xpaths, str):
+            link_xpaths = [link_xpaths]
+
         self.logger.info("Clicking on download file element.")
-        try: 
-            element = self.wait.until(Ec.presence_of_element_located((locator_type, locator)))
 
-            elements = self.driver.find_elements(By.XPATH, locator)
+        def links_visible(driver):
+            for xpath in link_xpaths:
+                elements = driver.find_elements(By.XPATH, xpath)
+                if elements:
+                    return True
+            return False
 
-            if not elements:
+        try:
+            self.wait.until(links_visible)
+            candidate_elements = []
+            chosen_pattern = None
+            for xpath in link_xpaths:
+                elements = self.driver.find_elements(By.XPATH, xpath)
+                if elements:
+                    candidate_elements = elements
+                    chosen_pattern = xpath
+            if not candidate_elements:
                 self.logger.warning("No download link found, skiping download ")
                 return False
 
-            last_element = elements[-1]
+            last_element = candidate_elements[-1]
+            self.logger.info("Download link resolved with pattern: %s", chosen_pattern)
             self._move_mouse_to_element(last_element)
             self.logger.info("Pausing 5 seconds before download click")
             self._human_pause(5.0, 5.0)
             self.action.move_to_element(last_element)\
-            .pause(0.3)\
-            .click()\
-            .perform()
+                .pause(0.3)\
+                .click()\
+                .perform()
             self._human_pause(4.5, 6.8)
             return True
         except Exception as e:
             self.logger.error(f"Faild to download {e}")
             return False
 
-    def download_with_retry(self, link_xpath: str, retry_wait: float = 10.0) -> bool:
+    def download_with_retry(self, link_xpaths, retry_wait: float = 10.0) -> bool:
         """Ensures download retry after prompt submission without losing scroll state."""
-        self.scroll_until_link_present(link_xpath)
+        self.scroll_until_link_present(link_xpaths)
         self._human_pause(1.8, 3.4)
-        if self.download_file():
+        if self.download_file(link_xpaths):
             return True
 
         self.logger.warning("Download attempt failed, retrying after %s seconds.", retry_wait)
@@ -560,9 +577,9 @@ class ChatGptAutomation:
         except Exception as exc:
             self.logger.debug("Scroll to bottom failed during retry: %s", exc)
 
-        self.scroll_until_link_present(link_xpath)
+        self.scroll_until_link_present(link_xpaths)
         self._human_pause(1.0, 2.0)
-        return self.download_file()
+        return self.download_file(link_xpaths)
   
     def create_new_branch_switch_driver(self):
         """Ye function new branch create karta hai or sath me driver ko main chat se brach wali chat pe switch karta hai"""
@@ -929,7 +946,7 @@ class ChatGptAutomation:
         refined = [self._refine_prompt(text, page_name, labels[idx]) for idx, text in enumerate(rendered)]
         return tuple(refined)
 
-    def _process_page(self, page_name: str, send_button_locator, download_link_xpath) -> tuple[bool, str, dict]:
+    def _process_page(self, page_name: str, send_button_locator, download_link_xpaths) -> tuple[bool, str, dict]:
         try:
             prompt1, prompt2, prompt3 = self._prepare_prompts(page_name)
             self._update_snackbar(f"Ready: {page_name} plan prompt")
@@ -971,7 +988,7 @@ class ChatGptAutomation:
 
             if self._should_run_step("download1"):
                 self._update_snackbar(f"{page_name}: Download prep")
-                download_success = self.download_with_retry(download_link_xpath)
+                download_success = self.download_with_retry(download_link_xpaths)
                 step_status["code_download"] = "1" if download_success else "0"
                 success = download_success and success
                 self._human_pause(2.7, 4.5)
@@ -991,7 +1008,7 @@ class ChatGptAutomation:
                 self._update_snackbar(f"{page_name}: Prompt3 bypassed")
 
             if self._should_run_step("download2"):
-                download_success = self.download_with_retry(download_link_xpath)
+                download_success = self.download_with_retry(download_link_xpaths)
                 step_status["docs_download"] = "1" if download_success else "0"
                 success = download_success and success
                 self._human_pause(2.7, 4.5)
@@ -1023,7 +1040,7 @@ class ChatGptAutomation:
     
     def main(self):
         """Is function me baki sare funtion call kiye hai loop ke satha me yhi branch create, text type, Respose wait, Scroll or file download ka function call kiye hai or last me driver ko vapas main chat par switch kiya hai."""
-        download_link_xpath = '//a[contains(normalize-space(.), "Download")]'
+        download_link_xpaths = DOWNLOAD_LINK_XPATHS
         send_button_locator = (By.XPATH, '//button[@aria-label="Stop streaming"]')
         csv_path = self._ensure_tasks_csv()
 
@@ -1042,7 +1059,7 @@ class ChatGptAutomation:
                 continue
 
             self.logger.info("Processing page: %s", page_name)
-            success, generated_url, step_status = self._process_page(page_name, send_button_locator, download_link_xpath)
+            success, generated_url, step_status = self._process_page(page_name, send_button_locator, download_link_xpaths)
 
             if index is not None:
                 for column in STEP_STATUS_COLUMNS:
